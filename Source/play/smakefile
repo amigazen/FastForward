@@ -1,0 +1,33 @@
+#
+# Source/play/smakefile - Play example application
+#
+# Demonstrates the high-level Movie API. Built after the engine because
+# it links against fastforward.library produced by Source/library/.
+#
+# Amiga path conventions:
+#   /          one level up
+#   foo        relative to current dir (no leading ./ on Amiga)
+#
+
+CC      = sc
+LD      = slink
+INCDIR  = /include
+CFLAGS  = nostackcheck strmerge ignore=315 INCLUDEDIR $(INCDIR)
+
+LIB     = /library/fastforward.library
+TARGET  = Play
+
+all: $(TARGET)
+
+$(TARGET): play.o $(LIB)
+	$(LD) LIB:c.o play.o TO $@ LIB LIB:sc.lib LIB:amiga.lib SC SD ND
+
+play.o: play.c
+	$(CC) $(CFLAGS) OBJECTNAME $@ play.c
+
+install:
+	Copy $(TARGET) //SYS/Utilities/
+
+clean:
+	delete force quiet play.o
+	delete force quiet $(TARGET)

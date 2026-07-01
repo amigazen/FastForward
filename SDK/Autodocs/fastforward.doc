@@ -1,0 +1,2411 @@
+TABLE OF CONTENTS
+
+fastforward.library/--background--
+fastforward.library/BuildFFGraphFromFileA
+fastforward.library/BuildFFPipelineFromFile
+fastforward.library/CancelFFMovie
+fastforward.library/CloseFFMovie
+fastforward.library/CreateFFC2PA
+fastforward.library/CreateFFClockA
+fastforward.library/CreateFFGraphA
+fastforward.library/CreateFFPipelineA
+fastforward.library/DecodeFFThumbnailA
+fastforward.library/DeleteFFC2P
+fastforward.library/DeleteFFClock
+fastforward.library/DeleteFFGraph
+fastforward.library/DeleteFFPipeline
+fastforward.library/DisposeFFElement
+fastforward.library/FindFFPluginA
+fastforward.library/FreeFFFrameResult
+fastforward.library/FreeFFMediaInfo
+fastforward.library/GetFFClockTime
+fastforward.library/GetFFElementAttrsA
+fastforward.library/GetFFElementPad
+fastforward.library/GetFFLastError
+fastforward.library/GetFFMediaInfoAttrsA
+fastforward.library/GetFFMovieAttrsA
+fastforward.library/GetFFMovieDuration
+fastforward.library/GetFFMoviePosition
+fastforward.library/GetFFMovieSignalMask
+fastforward.library/GetFFMovieState
+fastforward.library/GetFFPadAttrsA
+fastforward.library/GetFFTrack
+fastforward.library/GetFFTrackAttrsA
+fastforward.library/GetFFTrackCount
+fastforward.library/LinkFFPads
+fastforward.library/LoadFFPlugins
+fastforward.library/NewFFCallbackSinkA
+fastforward.library/NewFFElementA
+fastforward.library/NextFFPlugin
+fastforward.library/OpenFFMovieA
+fastforward.library/PauseFFMovie
+fastforward.library/PlayFFMovie
+fastforward.library/PollFFMovieEvent
+fastforward.library/ProbeFFMediaA
+fastforward.library/RenderFFC2P
+fastforward.library/RunFFGraph
+fastforward.library/RunFFPipeline
+fastforward.library/SeekFFMovie
+fastforward.library/SetFFClockTime
+fastforward.library/SetFFElementAttrsA
+fastforward.library/SetFFLogLevel
+fastforward.library/SetFFMovieAttrsA
+fastforward.library/SetFFTrackAttrsA
+fastforward.library/StartFFClock
+fastforward.library/StopFFClock
+fastforward.library/StopFFGraph
+fastforward.library/StopFFMovie
+fastforward.library/StopFFPipeline
+fastforward.library/UnlinkFFPad
+fastforward.library/UnloadFFPlugins
+fastforward.library/WaitFFClock
+
+
+fastforward.library/--background--            fastforward.library/--background--
+
+    PURPOSE
+        fastforward.library is the Amiga multimedia engine: a runtime
+        for opening, demuxing, decoding, mixing, transcoding and
+        rendering audio, video, subtitle and timed-data streams.
+
+        The architecture borrows from QuickTime (Movie / Track),
+        ffmpeg (AVFormat / AVCodec / AVStream), GStreamer (Element /
+        Pad / Bin) and DirectShow (Filter Graph), but the surface is
+        pure Amiga - tag lists, OpenLibrary refcounting, BPTR file
+        handles, exec signal masks for waiting, and realtime.library
+        synchronisation for sequencer / NLE workloads.
+
+        Two layers sit on top of one shared runtime:
+
+           * High-level Movie API. Open a path, get tracks, set
+             sinks, play. A player application fits in roughly
+             30 lines of C.
+           * Low-level Graph API. Create Elements, get their Pads,
+             link them, drive the graph by hand. Sufficient for
+             non-linear editors, transcoders, music sequencers and
+             live mixers.
+
+        Both layers share the same plugin registry, clock subsystem,
+        host services and event queue.
+
+    DESIGN PHILOSOPHY
+        FastForward is named for the tape-deck metaphor and the API
+        leans into it: a media stream is a tape, the engine is the
+        deck, and the application drives it with the same controls a
+        real-world deck has. PlayFFMovie / PauseFFMovie / StopFFMovie
+        / SeekFFMovie are the literal deck buttons; the convenience
+        macros RewindFFMovie, FastForwardFFMovie, ReverseFFMovie and
+        ScanFFMovie compose them into one-call equivalents.
+
+        The library is written exclusively against the Amiga ROM /
+        NDK API surface for raw speed - no libc, no POSIX types. 
+        Tag lists are walked through utility.library, signals replace 
+        callbacks where a Wait() will do, and realtime.library drives the
+        master clock when sequencers / NLEs need shared tempo
+        (Conductor + Player).
+
+    OPENING THE LIBRARY
+        FastForward is opened the same way as every Amiga library:
+
+            #include <libraries/fastforward.h>
+            #include <proto/fastforward.h>
+
+            struct Library *FastForwardBase = FF_OpenLibrary(FF_API_VERSION);
+            if (FastForwardBase == NULL) {
+                /* error */
+            }
+            LoadFFPlugins(NULL);
+            ...
+            UnloadFFPlugins();
+            FF_CloseLibrary(FastForwardBase);
+
+    PLUGIN DIRECTORY
+        LoadFFPlugins(NULL) uses the default directory, resolved
+        once at library-open time using:
+
+            1. ENV variable  FastForward/Plugins
+            2. logical assign FastForward:    (plugins live in
+                                               FastForward:Plugins/)
+            3. fallback       LIBS:FastForward/Plugins
+
+    PLUGIN CONTRACT
+        A FastForwarf Plugin is a LoadSeg binary that begins with 
+        FFPluginHead (0x70FF4E75, id 'FFPI') and exposes one or
+        more FFPlugin records. Plugin binary names use the plugin kind
+        as the extension, e.g. pcm.demux, pcm.codec, file.source,
+        ahi.sink.
+
+        Plugin kinds (FFK_*) are:
+
+            FFK_SOURCE (1)  - byte source: file, memory, URL, hook
+            FFK_DEMUX  (2)  - container parser
+            FFK_CODEC  (3)  - encoder / decoder
+            FFK_FILTER (4)  - in-place sample / pixel filter
+            FFK_SINK   (5)  - terminal output: AHI, video, callback
+            FFK_MUX    (6)  - container writer
+            FFK_CLOCK  (7)  - alternative clock backend
+
+        Plugins receive an FFHost struct with allocator, logger,
+        library opener, current clock pointer, event poster and
+        pooled buffer allocator. Reentrancy is automatic because
+        unlike shared libraries, every Open allocates a fresh instance.
+
+    EVENTS
+        Plugins post FFEvent records (format change, seek complete,
+        end-of-stream, decoded metadata tags, QoS feedback, error
+        reports) onto the owning Movie. The application drains them
+        on its own task by waiting on the Movie's signal mask
+        (GetFFMovieSignalMask) and calling PollFFMovieEvent() in a
+        loop:
+
+            FFEV_FORMAT   (1)  - format change negotiation
+            FFEV_SEEK     (2)  - downstream seek completed
+            FFEV_FLUSH    (3)  - discard pending data
+            FFEV_EOS      (4)  - end of stream
+            FFEV_TAGS     (5)  - metadata tag list available
+            FFEV_QOS      (6)  - quality-of-service feedback
+            FFEV_PROGRESS (7)  - buffering / transcode progress
+            FFEV_NETWORK  (8)  - network state change
+            FFEV_ERROR    (9)  - structured error posted to movie
+
+    ERROR REPORTING
+        Functions that can fail set a per-task error record
+        retrievable via GetFFLastError(). The error codes are listed
+        in <libraries/fastforward.h>; FFERR_NONE is zero. Negative
+        values follow Amiga convention.
+
+    SEE ALSO
+        datatypes.library/--background--, realtime.library, 
+        libraries/fastforward.h, libraries/ffplugin.h
+
+
+fastforward.library/BuildFFGraphFromFileA fastforward.library/BuildFFGraphFromFileA
+
+    NAME
+        BuildFFGraphFromFileA - Auto-build a default playback graph
+                                for a file. (V1)
+
+    SYNOPSIS
+        graph = BuildFFGraphFromFileA(path, tags);
+        d0                            a0    a1
+
+        struct FFGraph *BuildFFGraphFromFileA(CONST_STRPTR,
+                                              struct TagItem *);
+
+    FUNCTION
+        Convenience for callers that want the auto-detected element
+        chain for a file - typically source -> demux -> codec ->
+        sink, with sinks chosen from the registry to match the
+        decoded media kind (e.g. an AHI sink for an audio-only
+        stream).
+
+        After the graph returns the caller may freely rewire it:
+        DisposeFFElement() the default sink and replace it with a
+        callback sink for transcoding or a custom render target,
+        then call RunFFGraph() to drive the assembled pipeline.
+
+    INPUTS
+        path - DOS path of the source file. Must be accessible at
+               the time of the call.
+        tags - Optional tag list. Forwarded to the underlying
+               CreateFFGraphA() and to each element's Configure
+               step; useful tags include FFE_RunMode for per-element
+               execution mode and the FFSO_* source-configuration
+               tags.
+
+    RESULT
+        graph - Newly created graph, or NULL on failure. Call
+                GetFFLastError() for detail.
+
+    SEE ALSO
+        CreateFFGraphA(), NewFFElementA(), DisposeFFElement(),
+        NewFFCallbackSinkA(), RunFFGraph(), DeleteFFGraph()
+
+
+fastforward.library/BuildFFPipelineFromFile fastforward.library/BuildFFPipelineFromFile
+
+    NAME
+        BuildFFPipelineFromFile - Populate a legacy v0 pipeline
+                                  from a file. (V1)
+
+    SYNOPSIS
+        rc = BuildFFPipelineFromFile(pipe, path);
+        d0                           a0    a1
+
+        LONG BuildFFPipelineFromFile(struct FFPipeline *,
+                                     CONST_STRPTR);
+
+    FUNCTION
+        Convenience entry point that retrofits the v0 FFPipeline
+        surface with the new auto-detection logic introduced for the
+        Movie / Graph API. Probes the file, selects matching demux
+        and codec plugins from the registry, configures them, and
+        attaches default sinks for any audio or video tracks
+        encountered.
+
+        Pipeline is the legacy alias for FFGraph. New code should
+        prefer the Movie API (OpenFFMovieA) for playback and the
+        Graph API (CreateFFGraphA / BuildFFGraphFromFileA) for
+        editor / transcoder use; the pipeline LVOs remain available
+        for binary compatibility with v0 applications.
+
+    INPUTS
+        pipe - An empty pipeline created by CreateFFPipelineA().
+        path - DOS path of the source file.
+
+    RESULT
+        rc - FFERR_NONE on success, otherwise a negative FFERR_*
+             code.
+
+    SEE ALSO
+        CreateFFPipelineA(), DeleteFFPipeline(), RunFFPipeline(),
+        BuildFFGraphFromFileA()
+
+
+fastforward.library/CancelFFMovie         fastforward.library/CancelFFMovie
+
+    NAME
+        CancelFFMovie - Cancel a streaming or in-flight movie
+                        open / play. (V1)
+
+    SYNOPSIS
+        rc = CancelFFMovie(movie);
+        d0                 a0
+
+        LONG CancelFFMovie(struct FFMovie *);
+
+    FUNCTION
+        Signals the player Process to abort the current open or
+        playback operation and posts an FFEV_ERROR event with code
+        FFERR_CANCELLED. Used to interrupt a hung network open, a
+        slow HTTP source, or a long-running async preroll without
+        having to wait for a timeout.
+
+        The Movie object remains valid after the call; callers
+        normally follow CancelFFMovie() with CloseFFMovie() to
+        release it.
+
+    INPUTS
+        movie - The movie to cancel.
+
+    RESULT
+        rc - FFERR_NONE on success, FFERR_NOTOPEN if the movie is
+             no longer in an in-flight state.
+
+    SEE ALSO
+        OpenFFMovieA(), CloseFFMovie(), GetFFLastError()
+
+
+fastforward.library/CloseFFMovie          fastforward.library/CloseFFMovie
+
+    NAME
+        CloseFFMovie - Close and dispose of a movie. (V1)
+
+    SYNOPSIS
+        CloseFFMovie(movie);
+                     a0
+
+        VOID CloseFFMovie(struct FFMovie *);
+
+    FUNCTION
+        Tears down the playback Process, flushes all pipeline
+        buffers, closes any sinks the engine created, and frees the
+        movie record itself. Application-supplied sinks
+        (FFMT_AudioSink / FFMT_VideoSink) are detached but NOT
+        disposed - the caller retains ownership.
+
+        Safe with NULL.
+
+        EjectFFMovie() in <clib/fastforward_protos.h> is a macro
+        alias for CloseFFMovie(), provided for symmetry with the
+        tape-deck metaphor.
+
+    INPUTS
+        movie - Movie returned by OpenFFMovieA(), or NULL.
+
+    SEE ALSO
+        OpenFFMovieA(), CancelFFMovie()
+
+
+fastforward.library/CreateFFC2PA          fastforward.library/CreateFFC2PA
+
+    NAME
+        CreateFFC2PA - Create a chunky-to-planar render context. (V1)
+
+    SYNOPSIS
+        ctx = CreateFFC2PA(tags);
+        d0                 a0
+
+        struct FFC2PContext *CreateFFC2PA(struct TagItem *);
+
+    FUNCTION
+        Allocates a hyper-optimised chunky-to-planar render context
+        bound to a destination struct BitMap. Video sinks targeting
+        AGA / OCS / ECS bitmaps decode into chunky buffers in Fast
+        RAM and use this helper to scatter the result into the
+        Chip-RAM playfield planes for the copper, blitter or Paula
+        to consume.
+
+        The CPU backend is selected once at create time from
+        SysBase->AttnFlags: 68020+ gets a register-pack path that
+        skips the lookup table on the full-byte hot path; 68000 /
+        68010 use the bitspread fallback. The 2 KiB bitspread table
+        is built once per FastForwardBase and shared by every
+        context. Plane pointers are resolved into a per-context
+        cache so the hot path never walks bm->Planes[] per row.
+
+        RTG video cards (Picasso96, CyberGraphX) have a real chunky
+        framebuffer and do not need this helper; those sinks use
+        FFBM_VRAM and memcpy directly.
+
+    TAGS
+        FFC2PT_BitMap        - struct BitMap *, destination.
+                               Required.
+        FFC2PT_MaxWidth      - UWORD, widest blit ever passed to
+                               RenderFFC2P().
+        FFC2PT_MaxHeight     - UWORD, tallest blit ever passed.
+        FFC2PT_Depth         - ULONG, defaults to bm->Depth.
+        FFC2PT_Interleaved   - BOOL, BitMap is interleaved.
+        FFC2PT_AssumeAligned - BOOL, caller promises every cr_StartX
+                               and cr_Width passed to RenderFFC2P()
+                               is a multiple of 8. Lets the engine
+                               pick the leading/trailing-free fast
+                               path at create time.
+
+    RESULT
+        ctx - Opaque context, or NULL on failure. Call
+              GetFFLastError() for detail.
+
+    SEE ALSO
+        RenderFFC2P(), DeleteFFC2P(), fastforward/ff_c2p.h
+
+
+fastforward.library/CreateFFClockA        fastforward.library/CreateFFClockA
+
+    NAME
+        CreateFFClockA - Create a master / slave clock. (V1)
+
+    SYNOPSIS
+        clock = CreateFFClockA(tags);
+        d0                     a0
+
+        struct FFClock *CreateFFClockA(struct TagItem *);
+
+    FUNCTION
+        Allocates an FFClock backed by one of four timing sources.
+        Every Graph carries a master FFClock; sequencer / NLE
+        applications create their own clock and attach it via
+        FFMT_Clock on OpenFFMovieA() or pass it to CreateFFGraphA().
+
+        Clock kinds (FFCT_Kind):
+
+            FFCK_TIMER    (1) - timer.device EUNIT_MICROHZ via
+                                ReadEClock. Default. ~1us
+                                resolution.
+            FFCK_REALTIME (2) - realtime.library Conductor.
+                                Sequencers / NLE timelines that
+                                share tempo with CAMD, OctaMED,
+                                Bars&Pipes.
+            FFCK_AUDIO    (3) - Slaves to the audio sink's sample
+                                clock. Use for A/V sync.
+            FFCK_EXTERNAL (4) - Application drives SetFFClockTime()
+                                itself. Mixer authoring tools.
+
+        For FFCK_REALTIME, set FFCT_ExternalSync = TRUE to make this
+        clock's Player the external sync source for its Conductor
+        (FastForward becomes the timing master); leave it FALSE to
+        slave to whichever third party already owns the Conductor.
+
+    TAGS
+        FFCT_Kind          - FFCK_* selecting the backend.
+        FFCT_TimeScale     - Ticks per second. Default is
+                             FF_TIMESCALE_USEC.
+        FFCT_Conductor     - realtime.library Conductor pointer.
+        FFCT_ConductorName - Look up an existing named Conductor
+                             (e.g. "BarsAndPipes", "CAMD").
+        FFCT_TickRate      - PPQN tick rate for Conductor mode.
+        FFCT_Tempo         - BPM * 1000.
+        FFCT_ExternalSync  - BOOL. TRUE: this clock's Player becomes
+                             PLAYER_ExtSync source.
+        FFCT_PlayerHandle  - struct Player **. Output: receives the
+                             internal Player when FFCK_REALTIME.
+
+    RESULT
+        clock - Newly created clock, or NULL on failure.
+
+    SEE ALSO
+        DeleteFFClock(), StartFFClock(), StopFFClock(),
+        GetFFClockTime(), SetFFClockTime(), WaitFFClock()
+
+
+fastforward.library/CreateFFGraphA        fastforward.library/CreateFFGraphA
+
+    NAME
+        CreateFFGraphA - Create an empty filter graph. (V1)
+
+    SYNOPSIS
+        graph = CreateFFGraphA(tags);
+        d0                     a0
+
+        struct FFGraph *CreateFFGraphA(struct TagItem *);
+
+    FUNCTION
+        Allocates an empty FFGraph. Elements are then added via
+        NewFFElementA() and wired together by name through
+        GetFFElementPad() and LinkFFPads().
+
+        Each graph owns a master clock. Pass an existing FFClock
+        via tags to share timing across multiple graphs (e.g. each
+        track of an NLE timeline as its own graph, all attached to
+        the same FFCK_REALTIME Conductor), or omit and let the
+        engine create a default FFCK_TIMER clock on first use.
+
+        Use BuildFFGraphFromFileA() for the common case of auto-
+        detecting source / demux / codec / sink for a file path.
+
+    INPUTS
+        tags - Optional tag list. May include FFMT_Clock to share
+               an existing clock with another graph or movie.
+
+    RESULT
+        graph - Newly created graph, or NULL on failure.
+
+    SEE ALSO
+        DeleteFFGraph(), NewFFElementA(), LinkFFPads(),
+        RunFFGraph(), BuildFFGraphFromFileA()
+
+
+fastforward.library/CreateFFPipelineA     fastforward.library/CreateFFPipelineA
+
+    NAME
+        CreateFFPipelineA - Create an empty legacy v0 pipeline. (V1)
+
+    SYNOPSIS
+        pipe = CreateFFPipelineA(tags);
+        d0                       a0
+
+        struct FFPipeline *CreateFFPipelineA(struct TagItem *);
+
+    FUNCTION
+        Allocates an empty legacy v0 pipeline. FFPipeline is an
+        alias for FFGraph kept for source compatibility with code
+        written against the v0 API; new code should prefer
+        CreateFFGraphA(). The two surfaces share the same underlying
+        implementation and pipelines may be operated on with either
+        Pipeline* or Graph* function families.
+
+    INPUTS
+        tags - Optional tag list. Reserved.
+
+    RESULT
+        pipe - Newly created pipeline, or NULL on failure.
+
+    SEE ALSO
+        DeleteFFPipeline(), BuildFFPipelineFromFile(),
+        RunFFPipeline(), CreateFFGraphA()
+
+
+fastforward.library/DecodeFFThumbnailA    fastforward.library/DecodeFFThumbnailA
+
+    NAME
+        DecodeFFThumbnailA - Decode a single frame as a preview
+                             image. (V1)
+
+    SYNOPSIS
+        frame = DecodeFFThumbnailA(tags);
+        d0                         a0
+
+        struct FFFrameResult *DecodeFFThumbnailA(struct TagItem *);
+
+    FUNCTION
+        Decodes one video frame at the requested timestamp and
+        returns it in an FFFrameResult. Used by file managers,
+        timeline scrubbers and player UIs to render preview
+        thumbnails without committing to a full playback graph.
+
+        For still images (PNG, ILBM, JPEG, GIF) without a video
+        codec plugin, the call returns NULL with FFERR_NOTSUPPORTED
+        and the caller should fall back to datatypes.library.
+
+        Animated GIFs are timed media: future gif.demux exposes
+        them as a video track with frame delays in FFImageFormat.
+
+    TAGS
+        FFTH_Path        - STRPTR, source path. Mutually exclusive
+                           with the other source tags.
+        FFTH_FileHandle  - BPTR, open file handle. Engine takes
+                           ownership.
+        FFTH_MemData     - APTR, in-memory buffer.
+        FFTH_MemSize     - ULONG, length of MemData.
+        FFTH_Time        - ULONG, clock-unit timestamp of the
+                           frame to decode. Defaults to 0.
+        FFTH_Width       - ULONG, maximum width in pixels (0 = no
+                           scaling).
+        FFTH_Height      - ULONG, maximum height in pixels.
+        FFTH_PixelFormat - ULONG, desired FFVF_* pixel format.
+
+    RESULT
+        frame - Newly allocated FFFrameResult; pass to
+                FreeFFFrameResult() when done. NULL on failure.
+
+    SEE ALSO
+        FreeFFFrameResult(), ProbeFFMediaA(),
+        datatypes.library/ReadDTObjectA
+
+
+fastforward.library/DeleteFFC2P           fastforward.library/DeleteFFC2P
+
+    NAME
+        DeleteFFC2P - Dispose of a chunky-to-planar render
+                      context. (V1)
+
+    SYNOPSIS
+        DeleteFFC2P(ctx);
+                    a0
+
+        VOID DeleteFFC2P(struct FFC2PContext *);
+
+    FUNCTION
+        Frees a context allocated by CreateFFC2PA(). The shared
+        bitspread lookup table stays resident until the library is
+        expunged. Safe with NULL.
+
+    INPUTS
+        ctx - The context to free, or NULL.
+
+    SEE ALSO
+        CreateFFC2PA(), RenderFFC2P()
+
+
+fastforward.library/DeleteFFClock         fastforward.library/DeleteFFClock
+
+    NAME
+        DeleteFFClock - Dispose of a clock. (V1)
+
+    SYNOPSIS
+        DeleteFFClock(clock);
+                      a0
+
+        VOID DeleteFFClock(struct FFClock *);
+
+    FUNCTION
+        Stops the clock if it is still running, detaches any
+        realtime.library Player it owns, and frees the clock
+        record. Any graphs or movies still using the clock are
+        switched back to a default FFCK_TIMER clock automatically.
+        Safe with NULL.
+
+    INPUTS
+        clock - Clock returned by CreateFFClockA(), or NULL.
+
+    SEE ALSO
+        CreateFFClockA()
+
+
+fastforward.library/DeleteFFGraph         fastforward.library/DeleteFFGraph
+
+    NAME
+        DeleteFFGraph - Dispose of a graph and all owned
+                        elements. (V1)
+
+    SYNOPSIS
+        DeleteFFGraph(graph);
+                      a0
+
+        VOID DeleteFFGraph(struct FFGraph *);
+
+    FUNCTION
+        Calls StopFFGraph() if the graph is running, then disposes
+        of every element owned by the graph (DisposeFFElement on
+        each), tears down all inter-element links, and frees the
+        graph record. Safe with NULL.
+
+    INPUTS
+        graph - Graph returned by CreateFFGraphA() or
+                BuildFFGraphFromFileA(), or NULL.
+
+    SEE ALSO
+        CreateFFGraphA(), StopFFGraph()
+
+
+fastforward.library/DeleteFFPipeline      fastforward.library/DeleteFFPipeline
+
+    NAME
+        DeleteFFPipeline - Dispose of a legacy v0 pipeline. (V1)
+
+    SYNOPSIS
+        DeleteFFPipeline(pipe);
+                         a0
+
+        VOID DeleteFFPipeline(struct FFPipeline *);
+
+    FUNCTION
+        Alias for DeleteFFGraph() that accepts the legacy FFPipeline
+        pointer type. Safe with NULL.
+
+    INPUTS
+        pipe - Pipeline returned by CreateFFPipelineA(), or NULL.
+
+    SEE ALSO
+        CreateFFPipelineA(), DeleteFFGraph()
+
+
+fastforward.library/DisposeFFElement      fastforward.library/DisposeFFElement
+
+    NAME
+        DisposeFFElement - Dispose of a graph element. (V1)
+
+    SYNOPSIS
+        DisposeFFElement(element);
+                         a0
+
+        VOID DisposeFFElement(struct FFElement *);
+
+    FUNCTION
+        Removes the element from its owning graph, unlinks every
+        pad it exposes (UnlinkFFPad on each), shuts down any
+        per-element Task / Process started for FFER_TASK /
+        FFER_PROCESS run modes, calls the plugin's Close hook, and
+        frees the element record.
+
+        Used by editors to swap elements in and out of a graph at
+        runtime - the surrounding elements remain operational and
+        any new element wired in their place via LinkFFPads()
+        resumes the data flow.
+
+        Safe with NULL.
+
+    INPUTS
+        element - Element returned by NewFFElementA() /
+                  NewFFCallbackSinkA(), or NULL.
+
+    SEE ALSO
+        NewFFElementA(), NewFFCallbackSinkA(), UnlinkFFPad()
+
+
+fastforward.library/FindFFPluginA         fastforward.library/FindFFPluginA
+
+    NAME
+        FindFFPluginA - Look up a plugin in the registry. (V1)
+
+    SYNOPSIS
+        plugin = FindFFPluginA(tags);
+        d0                     a0
+
+        struct FFPlugin *FindFFPluginA(struct TagItem *);
+
+    FUNCTION
+        Searches the registry for the first plugin matching every
+        supplied tag. Use to obtain a struct FFPlugin * to feed to
+        NewFFElementA(FFE_Plugin, ...) when the application wants a
+        specific plugin rather than letting the engine pick.
+
+    TAGS
+        FFE_Name       - STRPTR, plugin description substring.
+        FFE_Identifier - UWORD, plugin numeric id.
+        FFE_Kind       - ULONG, FFK_* kind filter.
+        FFE_Mime       - STRPTR, MIME type the plugin must handle.
+
+    RESULT
+        plugin - First matching plugin, or NULL.
+
+    SEE ALSO
+        NextFFPlugin(), NewFFElementA(),
+        LoadFFPlugins()
+
+
+fastforward.library/FreeFFFrameResult     fastforward.library/FreeFFFrameResult
+
+    NAME
+        FreeFFFrameResult - Free a decoded thumbnail frame. (V1)
+
+    SYNOPSIS
+        FreeFFFrameResult(frame);
+                          a0
+
+        VOID FreeFFFrameResult(struct FFFrameResult *);
+
+    FUNCTION
+        Frees a frame record returned by DecodeFFThumbnailA(),
+        including its fr_Data payload. Safe with NULL.
+
+    INPUTS
+        frame - Frame returned by DecodeFFThumbnailA(), or NULL.
+
+    SEE ALSO
+        DecodeFFThumbnailA()
+
+
+fastforward.library/FreeFFMediaInfo       fastforward.library/FreeFFMediaInfo
+
+    NAME
+        FreeFFMediaInfo - Free a probe result. (V1)
+
+    SYNOPSIS
+        FreeFFMediaInfo(info);
+                        a0
+
+        VOID FreeFFMediaInfo(struct FFMediaInfo *);
+
+    FUNCTION
+        Frees a probe-result record returned by ProbeFFMediaA(),
+        including any duplicated strings (mi_Mime, mi_Title,
+        mi_DemuxerName, mi_Path). Safe with NULL.
+
+    INPUTS
+        info - Record returned by ProbeFFMediaA(), or NULL.
+
+    SEE ALSO
+        ProbeFFMediaA()
+
+
+fastforward.library/GetFFClockTime        fastforward.library/GetFFClockTime
+
+    NAME
+        GetFFClockTime - Read the current clock time. (V1)
+
+    SYNOPSIS
+        time = GetFFClockTime(clock);
+        d0                    a0
+
+        ULONG GetFFClockTime(struct FFClock *);
+
+    FUNCTION
+        Returns the clock's current time in its configured time
+        scale (FFCT_TimeScale). For FFCK_TIMER clocks this samples
+        timer.device via ReadEClock; for FFCK_REALTIME the value
+        comes from the underlying realtime.library Conductor; for
+        FFCK_AUDIO it tracks the sink's sample counter; for
+        FFCK_EXTERNAL it returns the most recent value set with
+        SetFFClockTime().
+
+        The clock advances only while it is running (StartFFClock /
+        StopFFClock).
+
+    INPUTS
+        clock - The clock.
+
+    RESULT
+        time - Current time in clock-scale units.
+
+    SEE ALSO
+        SetFFClockTime(), StartFFClock(), StopFFClock(),
+        WaitFFClock()
+
+
+fastforward.library/GetFFElementAttrsA    fastforward.library/GetFFElementAttrsA
+
+    NAME
+        GetFFElementAttrsA - Read element attributes. (V1)
+
+    SYNOPSIS
+        rc = GetFFElementAttrsA(element, tags);
+        d0                      a0       a1
+
+        LONG GetFFElementAttrsA(struct FFElement *,
+                                struct TagItem *);
+
+    FUNCTION
+        Reads attributes from element into the storage pointed at
+        by each TagItem's ti_Data field, in the manner of
+        GetDTAttrsA(). Used both for plain capability queries
+        (FFE_Kind, FFE_PadCount, FFE_Caps) and for the "stats for
+        nerds" inspector tags (FFE_Description, FFE_PluginVersion,
+        FFE_BuffersIn / Out, FFE_BytesIn / Out).
+
+    TAGS
+        FFE_Name          - STRPTR (out), plugin description.
+        FFE_Kind          - ULONG (out), FFK_* plugin kind.
+        FFE_Plugin        - struct FFPlugin * (out).
+        FFE_Mime          - STRPTR (out).
+        FFE_PadCount      - ULONG (out), number of pads.
+        FFE_Active        - BOOL (out), TRUE while element is
+                            running.
+        FFE_Caps          - ULONG (out), FFC_* capability mask.
+        FFE_Description   - STRPTR (out), plugin p_Description.
+        FFE_PluginVersion - ULONG (out), (version<<16) | revision.
+        FFE_BuffersIn     - ULONG (out), pushed-in buffer count.
+        FFE_BuffersOut    - ULONG (out), pushed-out buffer count.
+        FFE_BytesIn       - ULONG (out), pushed-in bytes.
+        FFE_BytesOut      - ULONG (out), pushed-out bytes.
+
+    INPUTS
+        element - The element.
+        tags    - Tag list whose ti_Data fields point to caller
+                  storage.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        SetFFElementAttrsA(), GetFFPadAttrsA()
+
+
+fastforward.library/GetFFElementPad       fastforward.library/GetFFElementPad
+
+    NAME
+        GetFFElementPad - Look up a pad on an element by name. (V1)
+
+    SYNOPSIS
+        pad = GetFFElementPad(element, name);
+        d0                    a0       a1
+
+        struct FFPad *GetFFElementPad(struct FFElement *,
+                                      CONST_STRPTR);
+
+    FUNCTION
+        Returns the named pad on the supplied element. Pad names
+        are conventional NUL-terminated strings; standard names are
+        declared in <libraries/ffplugin.h>:
+
+            FFPAD_SRC      "src"       output pad on sources /
+                                       demuxers / codecs
+            FFPAD_SINK     "sink"      input pad on filters /
+                                       codecs / sinks / muxers
+            FFPAD_AUDIO    "audio"     dedicated audio pad on
+                                       demuxers / muxers
+            FFPAD_VIDEO    "video"     dedicated video pad
+            FFPAD_SUBTITLE "subtitle"  timed-text pad
+            FFPAD_DATA     "data"      generic-data pad
+
+        Plugins are free to expose additional named pads beyond
+        these conventions (numbered audio tracks "audio0",
+        "audio1", ...). GetFFElementAttrsA(FFE_PadCount) returns
+        the total pad count for enumeration.
+
+    INPUTS
+        element - The element.
+        name    - NUL-terminated pad name.
+
+    RESULT
+        pad - The pad, or NULL if no pad of that name exists.
+
+    SEE ALSO
+        LinkFFPads(), UnlinkFFPad(), GetFFPadAttrsA()
+
+
+fastforward.library/GetFFLastError        fastforward.library/GetFFLastError
+
+    NAME
+        GetFFLastError - Retrieve structured detail for the last
+                         error reported on this task. (V1)
+
+    SYNOPSIS
+        rc = GetFFLastError(info);
+        d0                  a0
+
+        LONG GetFFLastError(struct FFErrorInfo *);
+
+    FUNCTION
+        Copies the most recent error record (numeric code,
+        subsystem and operation tags, the originating component
+        and function names, and a human-readable message) into the
+        caller's FFErrorInfo. Records are kept per task, so the
+        application that called the failing function is the one
+        that reads the error - exactly like IoErr() on dos.library.
+
+        Error codes (see <libraries/fastforward.h>):
+
+            FFERR_NONE          0   - success
+            FFERR_NOMEM        -1   - out of memory
+            FFERR_NODEV        -2   - device unavailable
+            FFERR_FORMAT       -3   - unrecognised container
+            FFERR_CODEC        -4   - codec failure
+            FFERR_STREAM       -5   - stream error
+            FFERR_SYNC         -6   - synchronisation failure
+            FFERR_BUFFER       -7   - buffer underrun / overflow
+            FFERR_NOTOPEN      -8   - object not open
+            FFERR_NOWINDOW     -9   - render target missing
+            FFERR_HARDWARE    -10   - hardware error
+            FFERR_DECODE      -11   - decoder rejected data
+            FFERR_NETWORK     -12   - network failure
+            FFERR_TIMEOUT     -13   - operation timed out
+            FFERR_NOTSEEKABLE -14   - source cannot seek
+            FFERR_CANCELLED   -15   - cancelled by caller
+            FFERR_NOTFOUND    -16   - resource not found
+            FFERR_NOTSUPPORTED -17  - feature unsupported
+
+    INPUTS
+        info - Storage to receive the error record.
+
+    RESULT
+        rc - The numeric error code (same as info->ei_Code).
+
+    SEE ALSO
+        libraries/fastforward.h FFERR_* constants
+
+
+fastforward.library/GetFFMediaInfoAttrsA  fastforward.library/GetFFMediaInfoAttrsA
+
+    NAME
+        GetFFMediaInfoAttrsA - Read fields from a probe result. (V1)
+
+    SYNOPSIS
+        rc = GetFFMediaInfoAttrsA(info, tags);
+        d0                        a0    a1
+
+        LONG GetFFMediaInfoAttrsA(struct FFMediaInfo *,
+                                  struct TagItem *);
+
+    FUNCTION
+        Reads fields from a probe result returned by
+        ProbeFFMediaA() into the storage pointed at by each
+        TagItem's ti_Data field. Tag-based access lets callers
+        request only the fields they need without committing to the
+        layout of struct FFMediaInfo.
+
+    TAGS
+        FFPG_Mime         - STRPTR (out).
+        FFPG_Score        - ULONG (out), 0..100 recognition score.
+        FFPG_Duration     - ULONG (out), in mi_TimeScale units.
+        FFPG_TrackCount   - ULONG (out).
+        FFPG_HasAudio     - BOOL (out).
+        FFPG_HasVideo     - BOOL (out).
+        FFPG_HasSubtitle  - BOOL (out).
+        FFPG_Seekable     - BOOL (out).
+        FFPG_Width        - ULONG (out), pixels.
+        FFPG_Height       - ULONG (out), pixels.
+        FFPG_SampleRate   - ULONG (out), Hz.
+        FFPG_Channels     - ULONG (out).
+        FFPG_Title        - STRPTR (out).
+        FFPG_DemuxerName  - STRPTR (out).
+
+    INPUTS
+        info - Result returned by ProbeFFMediaA().
+        tags - Tag list whose ti_Data fields point to caller
+               storage.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        ProbeFFMediaA(), FreeFFMediaInfo()
+
+
+fastforward.library/GetFFMovieAttrsA      fastforward.library/GetFFMovieAttrsA
+
+    NAME
+        GetFFMovieAttrsA - Read movie attributes. (V1)
+
+    SYNOPSIS
+        rc = GetFFMovieAttrsA(movie, tags);
+        d0                    a0     a1
+
+        LONG GetFFMovieAttrsA(struct FFMovie *, struct TagItem *);
+
+    FUNCTION
+        Reads attributes from movie into the storage pointed at by
+        each TagItem's ti_Data field, in the manner of
+        GetDTAttrsA(). Covers playback state, current timing,
+        stream geometry, metadata tag lookup, and the read-only
+        "stats for nerds" inspector tags.
+
+        Metadata access uses a request / response pair: set
+        FFMETA_Key to the desired key (FFMETA_Title, FFMETA_Artist,
+        ...) and FFMETA_String / FFMETA_Long to point at caller
+        storage for the result.
+
+    TAGS
+        FFMT_State          - ULONG (out), FFMS_*.
+        FFMT_Position       - ULONG (out), clock units.
+        FFMT_Duration       - ULONG (out).
+        FFMT_TimeScale      - ULONG (out).
+        FFMT_TrackCount     - ULONG (out).
+        FFMT_Title          - STRPTR (out).
+        FFMT_Mime           - STRPTR (out).
+        FFMT_URL            - STRPTR (out).
+        FFMT_HasAudio       - BOOL (out).
+        FFMT_HasVideo       - BOOL (out).
+        FFMT_HasSubtitle    - BOOL (out).
+        FFMT_Seekable       - BOOL (out).
+        FFMT_Width          - ULONG (out), pixels.
+        FFMT_Height         - ULONG (out), pixels.
+        FFMT_SampleRate     - ULONG (out), Hz.
+        FFMT_Channels       - ULONG (out).
+        FFMETA_Key/String/Long - tagged metadata lookup.
+
+        Inspector / "stats for nerds":
+
+        FFMT_PipelineSource    - struct FFElement * (out, ro).
+        FFMT_PipelineDemux     - struct FFElement * (out, ro).
+        FFMT_PipelineCodec     - struct FFElement * (out, ro).
+        FFMT_PipelineAudioSink - struct FFElement * (out, ro).
+        FFMT_PipelineVideoSink - struct FFElement * (out, ro).
+        FFMT_VideoFps          - LONG (out), Q16.16 fps.
+        FFMT_VideoBitrate      - ULONG (out), bits/sec.
+        FFMT_AudioBitrate      - ULONG (out), bits/sec.
+        FFMT_VideoFrames       - ULONG (out), decoded frames.
+        FFMT_DroppedFrames     - ULONG (out), late + dropped.
+        FFMT_AVDrift           - LONG (out), audio-video drift us.
+        FFMT_ClockKind         - ULONG (out), FFCK_* in use.
+
+    INPUTS
+        movie - The movie.
+        tags  - Tag list whose ti_Data fields point to caller
+                storage.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        SetFFMovieAttrsA(), GetFFTrackAttrsA(),
+        GetFFElementAttrsA()
+
+
+fastforward.library/GetFFMovieDuration    fastforward.library/GetFFMovieDuration
+
+    NAME
+        GetFFMovieDuration - Return total duration of a movie. (V1)
+
+    SYNOPSIS
+        duration = GetFFMovieDuration(movie);
+        d0                            a0
+
+        ULONG GetFFMovieDuration(struct FFMovie *);
+
+    FUNCTION
+        Returns the total duration of the movie's longest track in
+        the movie's FFMT_TimeScale units (typically microseconds).
+        Returns 0 if the demuxer cannot determine duration (live /
+        unbounded streams).
+
+        Equivalent to GetFFMovieAttrsA(movie, FFMT_Duration, ...).
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        duration - Duration in clock units, or 0 if unknown.
+
+    SEE ALSO
+        GetFFMoviePosition(), SeekFFMovie(), GetFFMovieAttrsA()
+
+
+fastforward.library/GetFFMoviePosition    fastforward.library/GetFFMoviePosition
+
+    NAME
+        GetFFMoviePosition - Return current playback position. (V1)
+
+    SYNOPSIS
+        position = GetFFMoviePosition(movie);
+        d0                            a0
+
+        ULONG GetFFMoviePosition(struct FFMovie *);
+
+    FUNCTION
+        Returns the current playhead position in the movie's
+        FFMT_TimeScale units (typically microseconds). Position
+        advances while the movie is in FFMS_PLAYING; pauses while
+        FFMS_PAUSED; resets to 0 on stop.
+
+        Equivalent to GetFFMovieAttrsA(movie, FFMT_Position, ...).
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        position - Current position in clock units.
+
+    SEE ALSO
+        SeekFFMovie(), GetFFMovieDuration(), GetFFMovieAttrsA()
+
+
+fastforward.library/GetFFMovieSignalMask  fastforward.library/GetFFMovieSignalMask
+
+    NAME
+        GetFFMovieSignalMask - Return signal mask for waiting on a
+                               movie. (V1)
+
+    SYNOPSIS
+        mask = GetFFMovieSignalMask(movie);
+        d0                          a0
+
+        ULONG GetFFMovieSignalMask(struct FFMovie *);
+
+    FUNCTION
+        Returns a signal mask the application can pass to Wait()
+        to block until the movie has new events queued, the
+        playback state changes, or a track-format renegotiation
+        completes. The same mask covers every kind of asynchronous
+        notification the movie produces - apps drain the queue with
+        PollFFMovieEvent() after Wait() returns.
+
+        The mask combines cleanly with IDCMP masks, MIDI input
+        masks, or SIGBREAKF_CTRL_C in the usual Amiga fashion:
+
+            mask = GetFFMovieSignalMask(m);
+            signals = Wait(mask | windowmask | SIGBREAKF_CTRL_C);
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        mask - Signal bit mask suitable for Wait().
+
+    SEE ALSO
+        PollFFMovieEvent(), exec.library/Wait()
+
+
+fastforward.library/GetFFMovieState       fastforward.library/GetFFMovieState
+
+    NAME
+        GetFFMovieState - Return the playback state of a movie. (V1)
+
+    SYNOPSIS
+        state = GetFFMovieState(movie);
+        d0                      a0
+
+        ULONG GetFFMovieState(struct FFMovie *);
+
+    FUNCTION
+        Returns one of:
+
+            FFMS_STOPPED   (0) - opened but not yet started
+            FFMS_OPENED    (1) - synchronous open completed
+            FFMS_PREROLL   (2) - filling buffers before play
+            FFMS_PLAYING   (3) - actively decoding and presenting
+            FFMS_PAUSED    (4) - decoding suspended at position
+            FFMS_FINISHED  (5) - reached EOS without error
+            FFMS_ERROR     (6) - playback aborted; see
+                                 GetFFLastError()
+
+        State transitions also raise events
+        (PollFFMovieEvent / FFEV_* records) so apps wake from
+        Wait() promptly when a movie completes.
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        state - FFMS_* value.
+
+    SEE ALSO
+        PlayFFMovie(), PauseFFMovie(), StopFFMovie(),
+        GetFFMovieSignalMask()
+
+
+fastforward.library/GetFFPadAttrsA        fastforward.library/GetFFPadAttrsA
+
+    NAME
+        GetFFPadAttrsA - Read pad attributes. (V1)
+
+    SYNOPSIS
+        rc = GetFFPadAttrsA(pad, tags);
+        d0                  a0   a1
+
+        LONG GetFFPadAttrsA(struct FFPad *, struct TagItem *);
+
+    FUNCTION
+        Reads attributes from pad into the storage pointed at by
+        each TagItem's ti_Data field. Graph applications inspect
+        negotiated formats before re-wiring (e.g. to confirm both
+        sides of a candidate LinkFFPads() agree on sample rate or
+        pixel format).
+
+    TAGS
+        FFPA_Name        - STRPTR (out), pad name.
+        FFPA_Direction   - ULONG (out), FFPD_* (source / sink).
+        FFPA_Linked      - BOOL (out), TRUE if peer attached.
+        FFPA_Peer        - struct FFPad * (out), linked peer.
+        FFPA_Caps        - ULONG (out), capability mask.
+        FFPA_AudioFormat - struct FFAudioFormat * (out).
+        FFPA_VideoFormat - struct FFVideoFormat * (out).
+        FFPA_Index       - ULONG (out), pad index on its element.
+
+    INPUTS
+        pad  - The pad.
+        tags - Tag list whose ti_Data fields point to caller
+               storage.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        LinkFFPads(), GetFFElementPad()
+
+
+fastforward.library/GetFFTrack            fastforward.library/GetFFTrack
+
+    NAME
+        GetFFTrack - Obtain a track by index. (V1)
+
+    SYNOPSIS
+        track = GetFFTrack(movie, index);
+        d0                 a0     d0
+
+        struct FFTrack *GetFFTrack(struct FFMovie *, ULONG);
+
+    FUNCTION
+        Returns the FFTrack at the supplied zero-based index. Track
+        ordering matches the demuxer's view of the source file;
+        track count is available via GetFFTrackCount() or
+        GetFFMovieAttrsA(FFMT_TrackCount).
+
+    INPUTS
+        movie - The movie.
+        index - Zero-based track index (0..GetFFTrackCount()-1).
+
+    RESULT
+        track - The track, or NULL if index is out of range.
+
+    SEE ALSO
+        GetFFTrackCount(), GetFFTrackAttrsA(), SetFFTrackAttrsA()
+
+
+fastforward.library/GetFFTrackAttrsA      fastforward.library/GetFFTrackAttrsA
+
+    NAME
+        GetFFTrackAttrsA - Read track attributes. (V1)
+
+    SYNOPSIS
+        rc = GetFFTrackAttrsA(track, tags);
+        d0                    a0     a1
+
+        LONG GetFFTrackAttrsA(struct FFTrack *, struct TagItem *);
+
+    FUNCTION
+        Reads attributes from track into the storage pointed at by
+        each TagItem's ti_Data field. Used to query track kind,
+        codec, geometry, language and the per-track sink / source
+        elements bound by the engine.
+
+    TAGS
+        FFTA_Index       - ULONG (out).
+        FFTA_Kind        - ULONG (out), FFTK_AUDIO / FFTK_VIDEO /
+                           FFTK_DATA / FFTK_MIDI / FFTK_SUBTITLE.
+        FFTA_Description - STRPTR (out).
+        FFTA_Enabled     - BOOL.
+        FFTA_Volume      - ULONG, 0..0x10000.
+        FFTA_Mute        - BOOL.
+        FFTA_AudioFormat - struct FFAudioFormat * (out).
+        FFTA_VideoFormat - struct FFVideoFormat * (out).
+        FFTA_Sink        - struct FFElement * (out).
+        FFTA_Source      - struct FFElement * (out).
+        FFTA_Duration    - ULONG (out).
+        FFTA_Language    - STRPTR (out), ISO 639.
+        FFTA_CodecName   - STRPTR (out).
+        FFTA_BitRate     - ULONG (out), bits/sec.
+        FFTA_Default     - BOOL (out), default track flag.
+        FFTA_Seekable    - BOOL (out).
+
+    INPUTS
+        track - The track.
+        tags  - Tag list whose ti_Data fields point to caller
+                storage.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        SetFFTrackAttrsA(), GetFFTrack()
+
+
+fastforward.library/GetFFTrackCount       fastforward.library/GetFFTrackCount
+
+    NAME
+        GetFFTrackCount - Return the number of tracks in a
+                          movie. (V1)
+
+    SYNOPSIS
+        count = GetFFTrackCount(movie);
+        d0                      a0
+
+        ULONG GetFFTrackCount(struct FFMovie *);
+
+    FUNCTION
+        Returns the number of independent tracks the demuxer
+        identified in the source. Equivalent to
+        GetFFMovieAttrsA(movie, FFMT_TrackCount, ...).
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        count - Number of tracks (>= 0).
+
+    SEE ALSO
+        GetFFTrack(), GetFFMovieAttrsA()
+
+
+fastforward.library/LinkFFPads            fastforward.library/LinkFFPads
+
+    NAME
+        LinkFFPads - Connect a source pad to a sink pad. (V1)
+
+    SYNOPSIS
+        rc = LinkFFPads(src, dst);
+        d0              a0   a1
+
+        LONG LinkFFPads(struct FFPad *, struct FFPad *);
+
+    FUNCTION
+        Connects an output pad (FFPD_SRC) to an input pad
+        (FFPD_SINK). The engine negotiates format compatibility
+        between the two pads' caps masks and refuses the link if no
+        common format is reachable.
+
+        For inline (FFER_INLINE) elements the link is a direct
+        function-pointer attachment; for FFER_TASK / FFER_PROCESS
+        elements it allocates per-link message ports and an
+        FFE_PoolDepth-deep buffer ring through which producer and
+        consumer hand buffers.
+
+        UnlinkFFPad() reverses the operation.
+
+    INPUTS
+        src - Source pad (output).
+        dst - Sink pad (input).
+
+    RESULT
+        rc - FFERR_NONE on success; FFERR_FORMAT if no compatible
+             format negotiation succeeded.
+
+    SEE ALSO
+        UnlinkFFPad(), GetFFElementPad(), GetFFPadAttrsA()
+
+
+fastforward.library/LoadFFPlugins         fastforward.library/LoadFFPlugins
+
+    NAME
+        LoadFFPlugins - Scan a directory and register plugins
+                        found there. (V1)
+
+    SYNOPSIS
+        count = LoadFFPlugins(dir);
+        d0                    a0
+
+        LONG LoadFFPlugins(CONST_STRPTR);
+
+    FUNCTION
+        Walks the supplied directory, LoadSeg()'s every file whose
+        contents begin with FFPluginHead (security word
+        0x70FF4E75, id 'FFPI'), and registers every FFPlugin record
+        the binary exposes with the engine's runtime registry.
+        Built-in plugins (file source, PCM demux, PCM codec, AHI
+        sink, callback sink, memory source) are registered
+        unconditionally and need no on-disk binary.
+
+        Pass NULL to use the default directory, resolved once at
+        library-open time via (in order):
+
+            1. ENV variable  FastForward/Plugins
+            2. logical assign FastForward:    (plugins live in
+                                               FastForward:Plugins/)
+            3. fallback       LIBS:FastForward/Plugins
+
+        Applications can override the default by passing an
+        explicit path - useful for transcoders / editors that ship
+        a private plugin bundle.
+
+        UnloadFFPlugins() reverses the operation.
+
+    INPUTS
+        dir - DOS path of the plugin directory, or NULL for the
+              default location.
+
+    RESULT
+        count - Number of plugins registered, or a negative
+                FFERR_* on failure.
+
+    SEE ALSO
+        UnloadFFPlugins(), FindFFPluginA(), NextFFPlugin(),
+        SetFFLogLevel()
+
+
+fastforward.library/NewFFCallbackSinkA    fastforward.library/NewFFCallbackSinkA
+
+    NAME
+        NewFFCallbackSinkA - Create a callback-driven sink
+                             element. (V1)
+
+    SYNOPSIS
+        sink = NewFFCallbackSinkA(graph, cb, tags);
+        d0                        a0     a1  a2
+
+        struct FFElement *NewFFCallbackSinkA(struct FFGraph *,
+                                             struct FFCallbacks *,
+                                             struct TagItem *);
+
+    FUNCTION
+        Allocates a built-in sink element that delivers decoded
+        audio / video / subtitle blocks to caller-supplied
+        function pointers in a struct FFCallbacks. Used to render
+        inside an application widget without writing a full plugin:
+        WritePixelArray() into a custom window, push samples into
+        a waveform display, write packets to a transcoder's output
+        mux, etc.
+
+        Callbacks run on the player Process. Heavy work that needs
+        Intuition or DOS context should be deferred onto the
+        application's main task via a message port.
+
+        Wire the callback sink as the audio or video sink of a
+        Movie by passing it to OpenFFMovieA(FFMT_AudioSink, ...) or
+        FFMT_VideoSink. In Graph mode, link the sink's "sink" pad
+        to whichever element produces the desired buffers.
+
+    INPUTS
+        graph - Owning graph.
+        cb    - Caller-allocated FFCallbacks. Members:
+                  cb_OnFormat   - format negotiation
+                  cb_OnAudio    - decoded PCM buffer
+                  cb_OnVideo    - decoded video frame
+                  cb_OnSubtitle - decoded subtitle cue
+                  cb_OnEvent    - upstream control event
+                  cb_UserData   - opaque pointer passed back
+        tags  - Optional tags; reserved for future expansion.
+
+    RESULT
+        sink - The new element, or NULL on failure.
+
+    SEE ALSO
+        NewFFElementA(), DisposeFFElement(),
+        OpenFFMovieA() (FFMT_AudioSink / FFMT_VideoSink)
+
+
+fastforward.library/NewFFElementA         fastforward.library/NewFFElementA
+
+    NAME
+        NewFFElementA - Create a graph element. (V1)
+
+    SYNOPSIS
+        element = NewFFElementA(graph, tags);
+        d0                      a0     a1
+
+        struct FFElement *NewFFElementA(struct FFGraph *,
+                                        struct TagItem *);
+
+    FUNCTION
+        Creates an FFElement bound to a registered plugin and adds
+        it to the supplied graph. Plugin selection is driven by
+        tags: name, identifier, kind, MIME, or explicit FFPlugin
+        pointer. The engine instantiates the plugin via its Open
+        hook and links the element into the graph's element list.
+
+        By default elements run in FFER_INLINE mode on the calling
+        task. Pass FFE_RunMode = FFER_TASK or FFER_PROCESS to give
+        the element its own Exec Task / DOS Process; pads then
+        communicate via Exec Messages on a per-link pool. Use
+        FFE_SyncToConductor on a producer element to attach a
+        realtime.library Player to the graph's master Conductor.
+
+    TAGS
+        FFE_Name            - STRPTR, plugin description match.
+        FFE_Identifier      - UWORD, plugin numeric id.
+        FFE_Kind            - ULONG, FFK_* (SOURCE, DEMUX, CODEC,
+                              FILTER, SINK, MUX, CLOCK).
+        FFE_Plugin          - struct FFPlugin *, explicit plugin.
+        FFE_Mime            - STRPTR, MIME the plugin must handle.
+        FFE_Callbacks       - struct FFCallbacks *.
+        FFE_UserData        - APTR, caller cookie.
+        FFE_NoAutoConfigure - BOOL, skip default configuration.
+        FFE_RunMode         - ULONG, FFER_INLINE / FFER_TASK /
+                              FFER_PROCESS.
+        FFE_TaskPriority    - BYTE, -128..+127 for FFER_TASK /
+                              FFER_PROCESS.
+        FFE_StackSize       - ULONG, bytes; default 8192.
+        FFE_SyncToConductor - BOOL, attach Player to graph's
+                              Conductor.
+        FFE_PoolDepth       - ULONG, buffers per output link;
+                              default 4.
+
+    INPUTS
+        graph - Owning graph.
+        tags  - Tag list - see TAGS.
+
+    RESULT
+        element - The new element, or NULL on failure.
+
+    SEE ALSO
+        DisposeFFElement(), NewFFCallbackSinkA(),
+        GetFFElementPad(), SetFFElementAttrsA(),
+        BuildFFGraphFromFileA()
+
+
+fastforward.library/NextFFPlugin          fastforward.library/NextFFPlugin
+
+    NAME
+        NextFFPlugin - Iterate the registered plugin list. (V1)
+
+    SYNOPSIS
+        plugin = NextFFPlugin(prev);
+        d0                    a0
+
+        struct FFPlugin *NextFFPlugin(struct FFPlugin *);
+
+    FUNCTION
+        Returns the next registered plugin after prev. Pass NULL
+        for prev to obtain the first plugin. The iteration order
+        is registration order; the registry is locked for the
+        duration of the call so it is safe to call from one task
+        while another task loads / unloads plugins.
+
+        Typical use:
+
+            struct FFPlugin *p = NULL;
+            while ((p = NextFFPlugin(p)) != NULL) {
+                /* inspect p->p_Description, p->p_Kind, etc. */
+            }
+
+    INPUTS
+        prev - Plugin returned by a previous call, or NULL to
+               start.
+
+    RESULT
+        plugin - Next plugin, or NULL at end-of-list.
+
+    SEE ALSO
+        FindFFPluginA(), LoadFFPlugins(), libraries/ffplugin.h
+
+
+fastforward.library/OpenFFMovieA          fastforward.library/OpenFFMovieA
+
+    NAME
+        OpenFFMovieA - Open a movie from a path, URL, memory
+                       buffer or callback. (V1)
+
+    SYNOPSIS
+        movie = OpenFFMovieA(tags);
+        d0                   a0
+
+        struct FFMovie *OpenFFMovieA(struct TagItem *);
+
+    FUNCTION
+        Opens a media source described by tags, probes it to
+        identify container and codecs, builds the default playback
+        graph (source -> demux -> codec(s) -> sink(s)) and returns
+        a Movie handle ready for transport. Set FFMT_AutoPlay =
+        TRUE to spawn the player Process and begin playback
+        immediately; otherwise the Movie is in FFMS_OPENED until
+        the application calls PlayFFMovie().
+
+        Sources accepted (mutually exclusive):
+
+            FFMT_Path        - DOS file path
+            FFMT_FileHandle  - BPTR; engine takes ownership
+            FFMT_URL         - network location (http/rtsp/hls;
+                               requires network source plugin)
+            FFMT_MemData +
+            FFMT_MemSize     - in-memory buffer
+            FFMT_IOCallbacks +
+            FFMT_IOUserData  - application-supplied byte stream
+
+        Audio / video output may be redirected by supplying
+        FFMT_AudioSink / FFMT_VideoSink (struct FFElement *
+        returned by NewFFCallbackSinkA() or NewFFElementA()), or by
+        passing render-target hints (FFMT_Window, FFMT_Screen,
+        FFMT_RastPort, FFMT_BitMap) that the engine routes to
+        whichever video sink ends up plumbed for the stream.
+
+    TAGS
+        FFMT_Path / FFMT_FileHandle / FFMT_URL / FFMT_MemData /
+        FFMT_MemSize / FFMT_IOCallbacks / FFMT_IOUserData
+            - Source selection (mutually exclusive).
+        FFMT_AutoPlay      - BOOL, start playback immediately.
+        FFMT_AudioSink     - struct FFElement *, app-supplied
+                             audio sink.
+        FFMT_VideoSink     - struct FFElement *, app-supplied
+                             video sink.
+        FFMT_AHIUnit       - ULONG, AHI device unit for default
+                             audio sink.
+        FFMT_Volume        - ULONG, 0..0x10000.
+        FFMT_Loop          - BOOL, loop on EOS.
+        FFMT_StartTime     - ULONG, start position in clock units.
+        FFMT_Clock         - struct FFClock *, external master
+                             clock.
+        FFMT_TimeScale     - ULONG, ticks per second.
+        FFMT_Window/Screen/
+        RastPort/BitMap    - render-target hints (video).
+        FFMT_DestX / DestY -
+        DestWidth / DestHeight - destination rectangle.
+        FFMT_PlayRate      - LONG, signed Q16.16 transport rate.
+        FFMT_LoopMode      - ULONG, FFLM_OFF / FFLM_LOOP /
+                             FFLM_PINGPONG / FFLM_REGION.
+        FFMT_LoopStart /
+        FFMT_LoopEnd       - ULONG, region-loop boundaries.
+        FFMT_Timeout       - ULONG, ms, for network sources.
+        FFMT_UserAgent     - STRPTR, for HTTP sources.
+        FFMT_ProxyServer /
+        FFMT_ProxyPort     - HTTP proxy.
+        FFMT_AsyncOpen     - BOOL, non-blocking open.
+        FFMT_OpenSignal    - ULONG, signal bit raised when an
+                             async open completes.
+        FFMT_CancelSignal  - ULONG, signal bit observed for
+                             user-driven abort.
+
+    RESULT
+        movie - The new movie, or NULL on failure. Call
+                GetFFLastError() for detail.
+
+    SEE ALSO
+        CloseFFMovie(), PlayFFMovie(), PauseFFMovie(),
+        StopFFMovie(), SeekFFMovie(), GetFFMovieSignalMask(),
+        PollFFMovieEvent(), NewFFCallbackSinkA(), CancelFFMovie()
+
+
+fastforward.library/PauseFFMovie          fastforward.library/PauseFFMovie
+
+    NAME
+        PauseFFMovie - Suspend playback at the current position. (V1)
+
+    SYNOPSIS
+        rc = PauseFFMovie(movie);
+        d0                a0
+
+        LONG PauseFFMovie(struct FFMovie *);
+
+    FUNCTION
+        The Pause deck button. Stops the clock and freezes every
+        running element at its current position. Buffer pools and
+        decoded frames are preserved so PlayFFMovie() resumes
+        immediately without re-decoding.
+
+        Equivalent to SetFFMovieAttrsA(movie, FFMT_PlayRate,
+        FF_RATE_PAUSE, TAG_DONE), but cheaper because the engine
+        knows to bypass any rate-change negotiation.
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        PlayFFMovie(), StopFFMovie(), SeekFFMovie(),
+        SetFFMovieAttrsA() (FFMT_PlayRate)
+
+
+fastforward.library/PlayFFMovie           fastforward.library/PlayFFMovie
+
+    NAME
+        PlayFFMovie - Begin or resume playback. (V1)
+
+    SYNOPSIS
+        rc = PlayFFMovie(movie);
+        d0               a0
+
+        LONG PlayFFMovie(struct FFMovie *);
+
+    FUNCTION
+        The Play deck button. Spawns (or resumes) the player
+        Process, starts the clock, and pushes the movie into the
+        FFMS_PLAYING state. Returns immediately - playback runs
+        asynchronously and the application waits on the movie's
+        signal mask for event notifications.
+
+        After preroll the engine transitions FFMS_PREROLL ->
+        FFMS_PLAYING. When the source reaches end-of-stream the
+        movie transitions to FFMS_FINISHED and posts an FFEV_EOS
+        event; with FFMT_Loop = TRUE it seeks back to the start
+        instead.
+
+        ResumeFFMovie() in <clib/fastforward_protos.h> is a macro
+        alias provided for symmetry with the tape-deck metaphor.
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        PauseFFMovie(), StopFFMovie(), SeekFFMovie(),
+        GetFFMovieSignalMask()
+
+
+fastforward.library/PollFFMovieEvent      fastforward.library/PollFFMovieEvent
+
+    NAME
+        PollFFMovieEvent - Drain one event from a movie's queue. (V1)
+
+    SYNOPSIS
+        rc = PollFFMovieEvent(movie, event);
+        d0                    a0     a1
+
+        LONG PollFFMovieEvent(struct FFMovie *, struct FFEvent *);
+
+    FUNCTION
+        Copies one pending event from the movie's event queue into
+        the caller-supplied FFEvent and removes it from the queue.
+        Returns > 0 when an event was returned, 0 when the queue
+        is empty, and a negative FFERR_* on error.
+
+        Applications drain the queue in a tight loop after Wait()
+        returns the movie's signal mask:
+
+            mask = GetFFMovieSignalMask(m);
+            signals = Wait(mask | mywin | SIGBREAKF_CTRL_C);
+            while (PollFFMovieEvent(m, &ev) > 0) {
+                switch (ev.fe_Kind) {
+                case FFEV_EOS:    ...
+                case FFEV_FORMAT: ...
+                case FFEV_SEEK:   ...
+                case FFEV_TAGS:   ...
+                case FFEV_QOS:    ...
+                case FFEV_ERROR:  ...
+                }
+            }
+
+        Event payloads are attached to the FFEvent record in
+        kind-specific fields (see <libraries/ffplugin.h>).
+
+    INPUTS
+        movie - The movie.
+        event - Storage to receive one event.
+
+    RESULT
+        rc - 1 if an event was returned, 0 if the queue is empty,
+             negative on error.
+
+    SEE ALSO
+        GetFFMovieSignalMask(), libraries/ffplugin.h FFEV_*
+
+
+fastforward.library/ProbeFFMediaA         fastforward.library/ProbeFFMediaA
+
+    NAME
+        ProbeFFMediaA - Identify a media source without building
+                        a playback graph. (V1)
+
+    SYNOPSIS
+        info = ProbeFFMediaA(tags);
+        d0                   a0
+
+        struct FFMediaInfo *ProbeFFMediaA(struct TagItem *);
+
+    FUNCTION
+        Identifies the container / codec / track layout of a media
+        source without committing to a full playback graph. Used
+        by file managers, browsers, file requesters and import
+        wizards to populate "details" panes from a fast header
+        sniff (FFREC_LIGHT) or a brief demuxer open
+        (FFREC_HEAVY) that also returns duration when
+        p_QueryDuration is available.
+
+        The returned FFMediaInfo must be freed with
+        FreeFFMediaInfo(). Individual fields are also reachable
+        via GetFFMediaInfoAttrsA() for callers that prefer tagged
+        access.
+
+    TAGS
+        FFPG_Path        - STRPTR, local file path.
+        FFPG_FileHandle  - BPTR, open file handle.
+        FFPG_URL         - STRPTR, http/rtsp/hls location.
+        FFPG_MemData     - APTR, in-memory header bytes.
+        FFPG_MemSize     - ULONG, length of MemData.
+        FFPG_Recognition - ULONG, FFREC_LIGHT (header only) or
+                           FFREC_HEAVY (open demuxer briefly).
+        FFPG_MediaTypes  - ULONG, FFTK_* mask to filter results.
+
+    RESULT
+        info - Newly allocated probe record, or NULL.
+
+    SEE ALSO
+        FreeFFMediaInfo(), GetFFMediaInfoAttrsA(),
+        DecodeFFThumbnailA()
+
+
+fastforward.library/RenderFFC2P           fastforward.library/RenderFFC2P
+
+    NAME
+        RenderFFC2P - Blit one chunky rectangle into the bound
+                      bitmap. (V1)
+
+    SYNOPSIS
+        rc = RenderFFC2P(ctx, req);
+        d0               a0   a1
+
+        LONG RenderFFC2P(struct FFC2PContext *,
+                         struct FFC2PRequest *);
+
+    FUNCTION
+        Translates the chunky rectangle described by req
+        (cr_StartX, cr_StartY, cr_Width, cr_Height, cr_SrcModulo)
+        into the planar bitmap bound at CreateFFC2PA() time. The
+        backend selected at create time (register-pack on 68020+,
+        bitspread on 68000/68010) processes the full-byte body in
+        the hot loop; leading and trailing partial-byte edges
+        always use the bitspread table.
+
+        Per-call flags (cr_Flags):
+
+            FFC2PF_NO_TRAILING_RMW - skip read-modify-write on the
+                                     right edge (full-width
+                                     overwrite, the common case).
+            FFC2PF_NO_LEADING_RMW  - same for the left edge.
+            FFC2PF_REENTRANT       - caller promises this context
+                                     is only ever touched by the
+                                     calling task; engine skips
+                                     the Forbid() it would
+                                     otherwise wrap around the
+                                     cached plane-pointer array.
+
+        Return codes:
+
+            FFC2P_OK              0
+            FFC2P_BAD_REQUEST    -1   - NULL pointer / zero size
+            FFC2P_OUT_OF_RANGE   -2   - rectangle escapes BitMap
+            FFC2P_NOT_IMPLEMENTED -3  - reserved
+
+        Reentrant per context: serialise calls if the same context
+        is shared between tasks (typical sinks bind a context to
+        one task and never share, avoiding any locking).
+
+    INPUTS
+        ctx - Context from CreateFFC2PA().
+        req - Populated FFC2PRequest.
+
+    RESULT
+        rc - FFC2P_OK or a negative FFC2P_* status.
+
+    SEE ALSO
+        CreateFFC2PA(), DeleteFFC2P(), fastforward/ff_c2p.h
+
+
+fastforward.library/RunFFGraph            fastforward.library/RunFFGraph
+
+    NAME
+        RunFFGraph - Start a graph running. (V1)
+
+    SYNOPSIS
+        rc = RunFFGraph(graph);
+        d0              a0
+
+        LONG RunFFGraph(struct FFGraph *);
+
+    FUNCTION
+        Walks the graph's element list, starts a Task for every
+        element whose FFE_RunMode is non-INLINE, allocates
+        per-element message ports (fe_InPort) and per-link buffer
+        pools (fe_BufferPool), and - for any element that asked
+        for FFE_SyncToConductor - creates a Player attached to the
+        graph's Conductor. Starts the graph's master clock and
+        kicks the source elements to begin producing data.
+
+        Returns once all tasks are spawned and the graph is
+        running; data flow continues asynchronously until
+        StopFFGraph(), an EOS, or a fatal error.
+
+    INPUTS
+        graph - Graph returned by CreateFFGraphA() /
+                BuildFFGraphFromFileA().
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        StopFFGraph(), DeleteFFGraph(), CreateFFGraphA()
+
+
+fastforward.library/RunFFPipeline         fastforward.library/RunFFPipeline
+
+    NAME
+        RunFFPipeline - Start a legacy v0 pipeline. (V1)
+
+    SYNOPSIS
+        rc = RunFFPipeline(pipe);
+        d0                 a0
+
+        LONG RunFFPipeline(struct FFPipeline *);
+
+    FUNCTION
+        Legacy v0 alias for RunFFGraph(). Accepts the FFPipeline
+        pointer type returned by CreateFFPipelineA() /
+        BuildFFPipelineFromFile().
+
+    INPUTS
+        pipe - The pipeline.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        StopFFPipeline(), RunFFGraph()
+
+
+fastforward.library/SeekFFMovie           fastforward.library/SeekFFMovie
+
+    NAME
+        SeekFFMovie - Seek to an absolute timestamp. (V1)
+
+    SYNOPSIS
+        rc = SeekFFMovie(movie, time, flags);
+        d0               a0     d0    d1
+
+        LONG SeekFFMovie(struct FFMovie *, ULONG, ULONG);
+
+    FUNCTION
+        Seeks the movie to the supplied absolute timestamp in the
+        movie's FFMT_TimeScale units. The demuxer chooses the
+        nearest keyframe at or before time; flags refine the
+        target:
+
+            FFCF_FLUSH    - discard pending buffers before seeking
+            FFCF_KEYFRAME - snap to the nearest keyframe
+            FFCF_BACKWARD - prefer seeking backwards over forwards
+            FFCF_ACCURATE - decode forward from keyframe to land
+                            on the exact requested frame
+
+        Returns immediately; the seek runs asynchronously and an
+        FFEV_SEEK event is posted on completion. Applications that
+        need synchronous behaviour wait on GetFFMovieSignalMask().
+
+        Sources that cannot seek (live streams, callback streams
+        without io_Seek) return FFERR_NOTSEEKABLE.
+
+    INPUTS
+        movie - The movie.
+        time  - Target time in clock units.
+        flags - Combination of FFCF_* flags.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        GetFFMoviePosition(), GetFFMovieDuration(),
+        PauseFFMovie(), PollFFMovieEvent()
+
+
+fastforward.library/SetFFClockTime        fastforward.library/SetFFClockTime
+
+    NAME
+        SetFFClockTime - Set the current clock time. (V1)
+
+    SYNOPSIS
+        rc = SetFFClockTime(clock, time);
+        d0                  a0     d0
+
+        LONG SetFFClockTime(struct FFClock *, ULONG);
+
+    FUNCTION
+        Sets the clock's current time in its configured time scale
+        (FFCT_TimeScale). For FFCK_EXTERNAL clocks this is the
+        usual entry point - the application drives the clock by
+        repeatedly calling SetFFClockTime() and elements bound to
+        the clock observe the change at the next tick boundary.
+
+        For FFCK_REALTIME, SetFFClockTime() defers to
+        SetConductorState() on the underlying realtime.library
+        Conductor; for FFCK_TIMER and FFCK_AUDIO the operation
+        applies an offset relative to the underlying time source.
+
+    INPUTS
+        clock - The clock.
+        time  - New time value in clock-scale units.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        GetFFClockTime(), CreateFFClockA()
+
+
+fastforward.library/SetFFElementAttrsA    fastforward.library/SetFFElementAttrsA
+
+    NAME
+        SetFFElementAttrsA - Set element attributes. (V1)
+
+    SYNOPSIS
+        rc = SetFFElementAttrsA(element, tags);
+        d0                      a0       a1
+
+        LONG SetFFElementAttrsA(struct FFElement *,
+                                struct TagItem *);
+
+    FUNCTION
+        Sets attributes on element. Tags cover both engine-level
+        properties (FFE_RunMode / FFE_TaskPriority / FFE_StackSize
+        / FFE_SyncToConductor / FFE_PoolDepth) and plugin-specific
+        configuration forwarded to the plugin's Configure hook
+        (e.g. FFSO_URL / FFSO_MemData on a source, AHI unit /
+        volume on an audio sink, encoder bitrate on an encoder).
+
+        Most engine-level properties must be set before the
+        containing graph is started; plugin-specific properties
+        may be changed at runtime when the plugin advertises
+        FFC_REENTRANT.
+
+    INPUTS
+        element - The element.
+        tags    - Tag list of attributes to set.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        GetFFElementAttrsA(), NewFFElementA()
+
+
+fastforward.library/SetFFLogLevel         fastforward.library/SetFFLogLevel
+
+    NAME
+        SetFFLogLevel - Set the global library log level. (V1)
+
+    SYNOPSIS
+        SetFFLogLevel(level);
+                      d0
+
+        VOID SetFFLogLevel(ULONG);
+
+    FUNCTION
+        Sets the threshold below which log messages are silently
+        dropped. Default is FFLOG_WARN. Plugins and engine code
+        call host->fh_Log() to emit messages; the engine compares
+        the supplied level against the global threshold and only
+        formats / writes messages at or above it.
+
+        Levels:
+
+            FFLOG_NONE  (0) - silence
+            FFLOG_ERROR (1) - structured error reports only
+            FFLOG_WARN  (2) - warnings and errors
+            FFLOG_INFO  (3) - additional informational notices
+            FFLOG_DEBUG (4) - verbose internal traces
+
+        Library log output is routed to stdout when the library
+        was opened from a CLI context, and otherwise discarded;
+        future revisions may route through a system-wide log
+        device.
+
+    INPUTS
+        level - FFLOG_* threshold.
+
+    SEE ALSO
+        libraries/fastforward.h FFLOG_* constants
+
+
+fastforward.library/SetFFMovieAttrsA      fastforward.library/SetFFMovieAttrsA
+
+    NAME
+        SetFFMovieAttrsA - Set movie attributes. (V1)
+
+    SYNOPSIS
+        rc = SetFFMovieAttrsA(movie, tags);
+        d0                    a0     a1
+
+        LONG SetFFMovieAttrsA(struct FFMovie *, struct TagItem *);
+
+    FUNCTION
+        Sets attributes on movie. The same tag set OpenFFMovieA()
+        accepts is honoured here for runtime mutations: change
+        volume, swap audio / video sinks, set transport rate and
+        loop mode, attach an external clock, retarget a video
+        sink to a different RastPort, etc.
+
+        Read-only tags (FFMT_State, FFMT_Position, FFMT_Duration,
+        FFMT_TrackCount, the FFMT_Pipeline* inspector tags) are
+        rejected with FFERR_NOTSUPPORTED.
+
+        The tape-deck convenience macros (FastForwardFFMovie,
+        ReverseFFMovie, ScanFFMovie, RewindFFMovie) in
+        <clib/fastforward_protos.h> are thin wrappers around
+        SetFFMovieAttrsA(movie, FFMT_PlayRate, ...).
+
+    TAGS
+        FFMT_AutoPlay / FFMT_Volume / FFMT_Loop / FFMT_LoopMode /
+        FFMT_LoopStart / FFMT_LoopEnd / FFMT_PlayRate /
+        FFMT_StartTime / FFMT_AudioSink / FFMT_VideoSink /
+        FFMT_AHIUnit / FFMT_Clock / FFMT_Window / FFMT_Screen /
+        FFMT_RastPort / FFMT_BitMap / FFMT_DestX / FFMT_DestY /
+        FFMT_DestWidth / FFMT_DestHeight / FFMT_Timeout /
+        FFMT_UserAgent / FFMT_ProxyServer / FFMT_ProxyPort /
+        FFMT_CancelSignal / FFMT_OpenSignal - see OpenFFMovieA().
+
+    INPUTS
+        movie - The movie.
+        tags  - Tag list of attributes to set.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        GetFFMovieAttrsA(), OpenFFMovieA()
+
+
+fastforward.library/SetFFTrackAttrsA      fastforward.library/SetFFTrackAttrsA
+
+    NAME
+        SetFFTrackAttrsA - Set track attributes. (V1)
+
+    SYNOPSIS
+        rc = SetFFTrackAttrsA(track, tags);
+        d0                    a0     a1
+
+        LONG SetFFTrackAttrsA(struct FFTrack *, struct TagItem *);
+
+    FUNCTION
+        Sets attributes on track. Common runtime mutations are
+        enable / disable for solo / mute behaviour, per-track
+        volume scaling, swap of the per-track sink for a custom
+        callback sink, and language selection on multilingual
+        sources.
+
+        Read-only attributes (FFTA_Index, FFTA_Kind,
+        FFTA_AudioFormat, FFTA_VideoFormat, FFTA_Duration,
+        FFTA_CodecName, FFTA_BitRate, FFTA_Default, FFTA_Seekable)
+        are rejected with FFERR_NOTSUPPORTED.
+
+    TAGS
+        FFTA_Enabled    - BOOL.
+        FFTA_Volume     - ULONG, 0..0x10000.
+        FFTA_Mute       - BOOL.
+        FFTA_Sink       - struct FFElement *.
+        FFTA_Source     - struct FFElement *.
+        FFTA_Language   - STRPTR, ISO 639.
+        FFTA_Description - STRPTR.
+
+    INPUTS
+        track - The track.
+        tags  - Tag list of attributes to set.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        GetFFTrackAttrsA(), GetFFTrack()
+
+
+fastforward.library/StartFFClock          fastforward.library/StartFFClock
+
+    NAME
+        StartFFClock - Start a clock advancing. (V1)
+
+    SYNOPSIS
+        rc = StartFFClock(clock);
+        d0                a0
+
+        LONG StartFFClock(struct FFClock *);
+
+    FUNCTION
+        Starts the clock running. After StartFFClock() the clock
+        advances at its configured tick rate; GetFFClockTime()
+        returns increasing values; tasks blocked in WaitFFClock()
+        wake when their target time is reached.
+
+        For FFCK_REALTIME this attaches the underlying Player to
+        its Conductor; for FFCK_TIMER it samples the current EClock
+        as the zero reference; for FFCK_AUDIO it begins tracking
+        the sink's sample counter; for FFCK_EXTERNAL it permits
+        WaitFFClock() to proceed (the clock still only advances
+        via SetFFClockTime()).
+
+    INPUTS
+        clock - The clock.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        StopFFClock(), CreateFFClockA(), WaitFFClock()
+
+
+fastforward.library/StopFFClock           fastforward.library/StopFFClock
+
+    NAME
+        StopFFClock - Stop a clock. (V1)
+
+    SYNOPSIS
+        rc = StopFFClock(clock);
+        d0               a0
+
+        LONG StopFFClock(struct FFClock *);
+
+    FUNCTION
+        Stops the clock. After StopFFClock() the clock no longer
+        advances; tasks blocked in WaitFFClock() return promptly
+        with the clock's last value. Repeated calls are safe.
+
+    INPUTS
+        clock - The clock.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        StartFFClock(), CreateFFClockA()
+
+
+fastforward.library/StopFFGraph           fastforward.library/StopFFGraph
+
+    NAME
+        StopFFGraph - Stop a running graph. (V1)
+
+    SYNOPSIS
+        StopFFGraph(graph);
+                    a0
+
+        VOID StopFFGraph(struct FFGraph *);
+
+    FUNCTION
+        Signals every running task in the graph (FFER_TASK /
+        FFER_PROCESS elements) to exit, flushes all in-flight
+        buffers, stops the graph's master clock, and tears the
+        per-link plumbing down. Safe to call from a signal
+        handler or another task; the call blocks until every task
+        has reported exit.
+
+        The graph itself remains valid - call RunFFGraph() again
+        to restart it, or DeleteFFGraph() to dispose of it.
+
+    INPUTS
+        graph - The graph.
+
+    SEE ALSO
+        RunFFGraph(), DeleteFFGraph()
+
+
+fastforward.library/StopFFMovie           fastforward.library/StopFFMovie
+
+    NAME
+        StopFFMovie - Stop playback and reset to the start. (V1)
+
+    SYNOPSIS
+        rc = StopFFMovie(movie);
+        d0               a0
+
+        LONG StopFFMovie(struct FFMovie *);
+
+    FUNCTION
+        The Stop deck button. Halts playback, flushes all decoded
+        buffers, and resets the playhead to position 0. The movie
+        transitions to FFMS_STOPPED; a subsequent PlayFFMovie()
+        starts from the beginning.
+
+        Use PauseFFMovie() to suspend playback without losing
+        position. Use RewindFFMovie() in
+        <clib/fastforward_protos.h> for the explicit "stop and
+        seek to head" behaviour expressed as one call.
+
+    INPUTS
+        movie - The movie.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        PlayFFMovie(), PauseFFMovie(), SeekFFMovie(),
+        CloseFFMovie()
+
+
+fastforward.library/StopFFPipeline        fastforward.library/StopFFPipeline
+
+    NAME
+        StopFFPipeline - Stop a running legacy v0 pipeline. (V1)
+
+    SYNOPSIS
+        StopFFPipeline(pipe);
+                       a0
+
+        VOID StopFFPipeline(struct FFPipeline *);
+
+    FUNCTION
+        Legacy v0 alias for StopFFGraph(). Accepts the FFPipeline
+        pointer type returned by CreateFFPipelineA() /
+        BuildFFPipelineFromFile().
+
+    INPUTS
+        pipe - The pipeline.
+
+    SEE ALSO
+        RunFFPipeline(), StopFFGraph()
+
+
+fastforward.library/UnlinkFFPad           fastforward.library/UnlinkFFPad
+
+    NAME
+        UnlinkFFPad - Disconnect a pad from its peer. (V1)
+
+    SYNOPSIS
+        rc = UnlinkFFPad(pad);
+        d0               a0
+
+        LONG UnlinkFFPad(struct FFPad *);
+
+    FUNCTION
+        Disconnects pad from its currently linked peer (the value
+        returned by GetFFPadAttrsA(FFPA_Peer, ...)). Both ends
+        return to the unlinked state. Per-link plumbing - message
+        ports, buffer pools, signal allocations - is reclaimed.
+
+        Used by editors to detach an element from the data flow
+        before disposing or replacing it. May be safely called on
+        a pad that is not currently linked.
+
+    INPUTS
+        pad - The pad.
+
+    RESULT
+        rc - FFERR_NONE on success.
+
+    SEE ALSO
+        LinkFFPads(), GetFFElementPad(), GetFFPadAttrsA()
+
+
+fastforward.library/UnloadFFPlugins       fastforward.library/UnloadFFPlugins
+
+    NAME
+        UnloadFFPlugins - Free every registered plugin. (V1)
+
+    SYNOPSIS
+        UnloadFFPlugins();
+
+        VOID UnloadFFPlugins(VOID);
+
+    FUNCTION
+        Disposes of every plugin registered with LoadFFPlugins(),
+        UnLoadSeg()s each LoadSeg'd binary, and resets the
+        registry to its initial state of built-in plugins only.
+
+        Applications normally call this once at shutdown, just
+        before FF_CloseLibrary(). UnloadFFPlugins() refuses to
+        free plugins that are still in use by an open Movie or
+        Graph; close those first.
+
+    SEE ALSO
+        LoadFFPlugins(), FindFFPluginA(), NextFFPlugin()
+
+
+fastforward.library/WaitFFClock           fastforward.library/WaitFFClock
+
+    NAME
+        WaitFFClock - Wait until a clock reaches a target time or
+                      a signal arrives. (V1)
+
+    SYNOPSIS
+        signals = WaitFFClock(clock, time, sigmask);
+        d0                    a0     d0    d1
+
+        ULONG WaitFFClock(struct FFClock *, ULONG, ULONG);
+
+    FUNCTION
+        Blocks the calling task until either the clock reaches
+        time (in its configured time scale) or one of the bits in
+        sigmask is signalled. Returns the bitmask of received
+        signals so multiplexing on Ctrl-C, IDCMP, MIDI input et
+        cetera works as usual:
+
+            while (running) {
+                ULONG now = GetFFClockTime(clock);
+                ULONG sigs = WaitFFClock(clock,
+                                         now + 1,
+                                         SIGBREAKF_CTRL_C);
+                if (sigs & SIGBREAKF_CTRL_C) break;
+                /* schedule next tick of work */
+            }
+
+        Sequencers and step-recorders use WaitFFClock() to fire
+        events at tempo-quantised boundaries; transport widgets
+        use it as the per-tick refresh primitive.
+
+    INPUTS
+        clock   - The clock.
+        time    - Target time in clock-scale units.
+        sigmask - Additional signal bits to observe.
+
+    RESULT
+        signals - Bitmask of received signals (zero if WaitFFClock
+                  returned because the clock reached time).
+
+    SEE ALSO
+        GetFFClockTime(), SetFFClockTime(), StartFFClock(),
+        StopFFClock(), exec.library/Wait()
